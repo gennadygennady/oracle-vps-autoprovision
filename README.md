@@ -86,3 +86,23 @@ References:
 - https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm
 - https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule
 - https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows
+
+## Optional Mac fallback timer
+
+`local_timer.py` uses the existing `gh` login to check the cloud workflow every
+300 seconds via a macOS LaunchAgent. It dispatches the same workflow only when it
+is active, has no active runs, the last run succeeded, and no run was created
+within five minutes. Oracle credentials remain in GitHub Secrets; this timer does
+not call Oracle. Cloud concurrency and all safety checks still apply. A simultaneous
+GitHub cron event can create a second serialized workflow run, so this does not
+guarantee exact five-minute spacing. On workflow success or a safety stop, the
+disabled workflow prevents further timer dispatches.
+
+The Mac must be awake and the user logged in. Sleeping/offline time is not replayed.
+Logs: `~/Library/Application Support/OracleAutoProvision/timer.log`.
+LaunchAgent: `~/Library/LaunchAgents/dev.gendi.oracle-vps-autoprovision.plist`.
+To stop the local timer:
+
+```sh
+launchctl bootout gui/$(id -u)/dev.gendi.oracle-vps-autoprovision
+```
