@@ -1,0 +1,9 @@
+*.pem
+.oci/
+.venv/
+__pycache__/
+diagnostic.json
+*.tfstate*
+*.zip
+*.log
+.env*
