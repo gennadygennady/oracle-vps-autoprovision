@@ -90,12 +90,12 @@ References:
 ## Optional Mac fallback timer
 
 `local_timer.py` uses the existing `gh` login to check the cloud workflow every
-300 seconds via a macOS LaunchAgent. It dispatches the same workflow only when it
+180 seconds via a macOS LaunchAgent. It dispatches the same workflow only when it
 is active, has no active runs, the last run succeeded, and no run was created
-within five minutes. Oracle credentials remain in GitHub Secrets; this timer does
+within three minutes. Oracle credentials remain in GitHub Secrets; this timer does
 not call Oracle. Cloud concurrency and all safety checks still apply. A simultaneous
 GitHub cron event can create a second serialized workflow run, so this does not
-guarantee exact five-minute spacing. On workflow success or a safety stop, the
+guarantee exact three-minute spacing. On workflow success or a safety stop, the
 disabled workflow prevents further timer dispatches.
 
 The Mac must be awake and the user logged in. Sleeping/offline time is not replayed.

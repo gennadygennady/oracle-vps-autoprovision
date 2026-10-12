@@ -14,6 +14,8 @@ class TimerTests(unittest.TestCase):
         self.assertEqual(decision({'state':'active'},[dict(old,status='queued')],now),'busy')
         self.assertEqual(decision({'state':'active'},[dict(old,conclusion='failure')],now),'review')
         self.assertEqual(decision({'state':'active'},[recent,dict(old,status='in_progress')],now),'busy')
+        self.assertEqual(decision({'state':'active'},[dict(old,created_at='2026-10-12T15:47:01Z')],now),'recent')
+        self.assertEqual(decision({'state':'active'},[dict(old,created_at='2026-10-12T15:47:00Z')],now),'dispatch')
 
 
 if __name__ == '__main__':

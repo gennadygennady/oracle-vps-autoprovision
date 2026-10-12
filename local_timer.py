@@ -9,7 +9,7 @@ import subprocess
 
 REPO = 'gennadygennady/oracle-vps-autoprovision'
 WORKFLOW = 'provision.yml'
-INTERVAL = 300
+INTERVAL = 180
 RUNTIME = Path.home() / 'Library/Application Support/OracleAutoProvision'
 
 
