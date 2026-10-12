@@ -130,7 +130,9 @@ class Controller:
             signer = oci.signer.Signer(tenancy=self.tenancy, user=os.environ['OCI_USER_OCID'],
                 fingerprint=os.environ['OCI_FINGERPRINT'], private_key_file_location=None,
                 private_key_content=os.environ['OCI_PRIVATE_KEY'])
-            options = {'config': {'region': REGION}, 'signer': signer}
+            options = {'config': {'region': REGION, 'tenancy':self.tenancy,
+                'user':os.environ['OCI_USER_OCID'], 'fingerprint':os.environ['OCI_FINGERPRINT'],
+                'key_content':os.environ['OCI_PRIVATE_KEY']}, 'signer': signer}
         options.update(timeout=(10, 25), retry_strategy=oci.retry.NoneRetryStrategy())
         self.rm = oci.resource_manager.ResourceManagerClient(**options)
         self.identity = oci.identity.IdentityClient(**options)

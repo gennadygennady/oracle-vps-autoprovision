@@ -4,12 +4,30 @@ import unittest
 from types import SimpleNamespace as N
 from unittest.mock import Mock, patch
 import zipfile
+import oci
 
 from provision import (Controller, GitHub, SafetyStop, capacity_only, check_free_budget,
                        config_digest, state_instances)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_github_credentials_produce_valid_sdk_config(self):
+        def oid(kind):
+            return '.'.join(['ocid1',kind,'oc1','','a'*40])
+        env={'OCI_STACK_ID':'stack','OCI_TENANCY_OCID':oid('tenancy'),'OCI_USER_OCID':oid('user'),
+             'OCI_FINGERPRINT':':'.join(['ab']*16),'OCI_PRIVATE_KEY':'in-memory-key'}
+        def client(**kwargs):
+            oci.config.validate_config(kwargs['config'])
+            self.assertEqual(kwargs['config']['key_content'],'in-memory-key')
+            self.assertNotIn('key_file',kwargs['config'])
+            return Mock()
+        with patch.dict('os.environ',env), patch('oci.signer.Signer'), \
+             patch('oci.resource_manager.ResourceManagerClient',side_effect=client), \
+             patch('oci.identity.IdentityClient',side_effect=client), \
+             patch('oci.core.ComputeClient',side_effect=client), \
+             patch('oci.core.BlockstorageClient',side_effect=client):
+            Controller(local=False)
+
     def test_only_explicit_capacity_error_is_retryable(self):
         self.assertTrue(capacity_only(['Error: 500-InternalError, Out of host capacity.']))
         self.assertTrue(capacity_only(['\x1b[31m│ Error: 500-InternalError, Out of host capacity.\x1b[0m']))
