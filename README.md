@@ -7,7 +7,7 @@ Ubuntu ARM image. This repository contains no Terraform source, state or keys.
 
 ## Operation
 
-The schedule is `*/5 * * * *` UTC, with a manual `workflow_dispatch` trigger.
+The schedule is `2-59/5 * * * *` UTC (minutes 2, 7, 12, ..., 57), with a manual `workflow_dispatch` trigger.
 GitHub schedules can be delayed or dropped; this is not a guaranteed five-minute
 timer. Public-repository schedules are disabled by GitHub after 60 days without
 repository activity. No automatic commits are made to circumvent this behavior.

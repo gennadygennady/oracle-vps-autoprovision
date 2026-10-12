@@ -2,7 +2,7 @@ name: Oracle Always Free VPS
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
