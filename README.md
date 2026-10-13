@@ -42,11 +42,21 @@ saved in the run summary and diagnostic artifact.
 Oracle API HTTP 429 is temporary: the attempt ends without immediately repeating
 Apply, and the workflow remains active. The next retry deadline is saved in the
 safe diagnostic artifact, and every following workflow reads it before making
-Oracle calls. Consecutive throttles back off for 180, 360, 720, 1440, then at most
-1800 seconds (a longer server `Retry-After` is respected). Non-throttled attempts
-reset the counter. No Oracle calls or Apply occur during cooldown. An interrupted
+Oracle calls. Throttling doubles the current learned attempt interval, starting
+with 360 seconds from the default 180, up to 1800 seconds (a longer server
+`Retry-After` is respected). After three submitted attempts without throttling
+(capacity failures count), the interval decreases by 10%, with a floor of 180
+seconds. It does not jump back to 180 after one successful API submission.
+Both rate-limit cooldowns and normal adaptive waits are persisted across runs;
+no Oracle calls or Apply occur before their deadline. An interrupted
 Apply is always discovered through jobs/state on the next actual inspection.
 Missing or expired prior diagnostic artifacts cause a clearly logged safety stop.
+Response/error diagnostics retain only `Retry-After`, `Date`, `RateLimit-*`,
+`X-RateLimit-*` and `RequestLimit-*` headers when supplied. Cookies and authorization
+headers are excluded. Submission headers are also saved in `diagnostic.json`.
+An empty set (or Date alone) means no limit/reset information was exposed.
+The learned `attempt_interval_seconds`, successful-attempt counter and
+`next_apply_at` deadline are visible in GitHub diagnostics and Mac logs.
 
 An open safety/success Issue is a durable latch even if workflow disabling fails.
 A previous unsuccessful GitHub run is an additional barrier. Do not delete the
@@ -161,7 +171,7 @@ are preserved in links; authentication credentials and other OCIDs remain masked
 Underlying failures disabling the workflow or creating its stop Issue are logged
 separately and retained in `stop_errors` in the same artifact.
 The Mac reads and caches each completed run's artifact to show the actual
-`capacity`, `throttled`, `cooldown`, `success` or `halted` outcome, rather than
+`capacity`, `throttled`, `cooldown`, `waiting`, `success` or `halted` outcome, rather than
 equating GitHub's `success` conclusion with a created VPS. Diagnostic-download
 failures are explicitly logged and do not change dispatch safety decisions.
 The last outcome is a historical observation. For cached cooldown results,

@@ -10,9 +10,9 @@ import zipfile
 import urllib.error
 import oci
 
-from diagnostics import safe_text
+from diagnostics import safe_text, rate_limit_headers
 from local_timer import GitHubAPIError, describe, latest_outcome, current_outcome_details
-from provision import GitHub, main, pending_cooldown, throttle_diagnostic, SafetyStop, oracle_job_url
+from provision import GitHub, main, pending_cooldown, throttle_diagnostic, SafetyStop, oracle_job_url, adaptive_interval
 
 
 class DiagnosticsTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class DiagnosticsTests(unittest.TestCase):
         now=datetime.datetime(2026,10,13,tzinfo=datetime.timezone.utc)
         error=oci.exceptions.ServiceError(429,'TooManyRequests',{},'Too many requests',operation_name='create_job')
         previous={}
-        for expected in [180,360,720,1440,1800,1800]:
+        for expected in [360,720,1440,1800,1800,1800]:
             previous=throttle_diagnostic(error,previous,now)
             self.assertEqual(previous['backoff_seconds'],expected)
         pending=pending_cooldown(previous,now+datetime.timedelta(seconds=10))
@@ -182,6 +182,53 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(result['oracle_wait_seconds'],0)
         self.assertFalse(result['oracle_cooldown_active'])
         self.assertEqual(cached['oracle_wait_seconds'],20)
+
+    def test_header_allowlist_excludes_auth_and_cookies(self):
+        headers={'Retry-After':'60','X-RateLimit-Remaining':'0','RateLimit-Reset':'100',
+                 'RequestLimit-Write-Remaining':'0','Authorization':'secret','Set-Cookie':'secret'}
+        result=rate_limit_headers(headers)
+        self.assertEqual(result['retry-after'],'60')
+        self.assertEqual(result['x-ratelimit-remaining'],'0')
+        self.assertNotIn('authorization',result)
+        self.assertNotIn('set-cookie',result)
+
+    def test_adaptive_interval_survives_success_and_eases_only_after_three_attempts(self):
+        now=datetime.datetime(2026,10,13,tzinfo=datetime.timezone.utc)
+        error=oci.exceptions.ServiceError(429,'TooManyRequests',{},'Too many requests')
+        previous=throttle_diagnostic(error,{},now)
+        self.assertEqual(previous['attempt_interval_seconds'],360)
+        for expected in [360,360,324]:
+            previous=adaptive_interval('capacity',previous,now)
+            self.assertEqual(previous['attempt_interval_seconds'],expected)
+        self.assertEqual(previous['successful_attempts_at_interval'],0)
+        waiting=pending_cooldown(previous,now+datetime.timedelta(seconds=10))
+        self.assertEqual(waiting['outcome'],'waiting')
+        self.assertEqual(waiting['wait_reason'],'adaptive_interval')
+        self.assertIsNone(pending_cooldown(previous,now+datetime.timedelta(seconds=324)))
+        again=throttle_diagnostic(error,previous,now)
+        self.assertEqual(again['attempt_interval_seconds'],648)
+
+    def test_adaptive_interval_keeps_busy_state_and_has_floor(self):
+        result=adaptive_interval('busy',{'attempt_interval_seconds':720,'successful_attempts_at_interval':2})
+        self.assertEqual(result['attempt_interval_seconds'],720)
+        self.assertEqual(result['successful_attempts_at_interval'],2)
+        self.assertNotIn('next_apply_at',result)
+        result=adaptive_interval('capacity',{'attempt_interval_seconds':180,'successful_attempts_at_interval':2})
+        self.assertEqual(result['attempt_interval_seconds'],180)
+
+    def test_waiting_does_not_construct_oracle_clients(self):
+        gh=Mock()
+        gh.guard.return_value={'outcome':'waiting','wait_seconds':120,'next_apply_at':'2026-10-13T12:00:00+00:00'}
+        with tempfile.TemporaryDirectory() as directory:
+            original=os.getcwd()
+            try:
+                os.chdir(directory)
+                with patch('sys.argv',['provision.py']),patch('provision.GitHub',return_value=gh), \
+                     patch('provision.Controller') as client,patch('provision.report'):
+                    self.assertEqual(main(),0)
+                    client.assert_not_called()
+            finally:
+                os.chdir(original)
 
 
 if __name__=='__main__':

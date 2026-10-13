@@ -6,6 +6,7 @@ import re
 import traceback
 import io
 import zipfile
+from collections.abc import Mapping
 
 
 def safe_text(value):
@@ -42,7 +43,18 @@ def error_fields(error):
             fields[name] = safe_text(value) if isinstance(value,str) else value
     fields['frames'] = [{'file':os.path.basename(f.filename),'line':f.lineno,'function':f.name}
                         for f in traceback.extract_tb(error.__traceback__)[-5:]]
+    if hasattr(error,'headers'):
+        fields['rate_limit_headers']=rate_limit_headers(error.headers)
     return fields
+
+
+def rate_limit_headers(headers):
+    """Only diagnostic limit headers; never cookies or authorization headers."""
+    if not isinstance(headers,Mapping):
+        return {}
+    return {str(name).lower():safe_text(value) for name,value in headers.items()
+            if str(name).lower() in {'retry-after','date'} or
+            str(name).lower().startswith(('ratelimit-','x-ratelimit-','requestlimit-'))}
 
 
 def read_diagnostic_zip(content):

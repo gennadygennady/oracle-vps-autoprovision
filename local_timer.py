@@ -93,9 +93,10 @@ def current_outcome_details(cached, now=None):
     result=dict(cached)
     if 'oracle_wait_seconds' in result:
         result['oracle_wait_seconds_at_run']=result.pop('oracle_wait_seconds')
-    if result.get('oracle_retry_at'):
+    deadline_text=result.get('oracle_retry_at') or result.get('oracle_next_apply_at')
+    if deadline_text:
         now=now or datetime.datetime.now(datetime.timezone.utc)
-        deadline=datetime.datetime.fromisoformat(result['oracle_retry_at'])
+        deadline=datetime.datetime.fromisoformat(deadline_text)
         result['oracle_wait_seconds']=max(0,math.ceil((deadline-now).total_seconds()))
         result['oracle_cooldown_active']=result['oracle_wait_seconds']>0
     return result
@@ -118,7 +119,9 @@ def latest_outcome(gh, runs):
         data=read_diagnostic_zip(api(gh,'GET',f'actions/artifacts/{matches[0]["id"]}/zip',binary=True))
         cached={'diagnostic_run_id':completed['id'],'diagnostic_run_url':completed.get('html_url'),
                 'last_oracle_outcome':data['outcome'],'diagnostic_mode':data.get('context',{}).get('mode')}
-        for field in ['retry_at','wait_seconds','backoff_seconds','consecutive_throttles','status','code','message']:
+        for field in ['retry_at','next_apply_at','wait_seconds','wait_reason','attempt_interval_seconds',
+                      'successful_attempts_at_interval','backoff_seconds','consecutive_throttles','status','code','message',
+                      'rate_limit_headers']:
             if field in data:
                 cached['oracle_'+field]=safe_text(data[field]) if isinstance(data[field],str) else data[field]
         context=data.get('context',{})

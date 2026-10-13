@@ -17,7 +17,7 @@ import urllib.error
 import zipfile
 
 import oci
-from diagnostics import error_fields, report, safe_text, read_diagnostic_zip
+from diagnostics import error_fields, report, safe_text, read_diagnostic_zip, rate_limit_headers
 
 REGION = 'ap-singapore-2'
 CONFIG_SHA256 = '5266612964d57c18270e5cc78917639a487de10b33b36ae61f7a189591614733'
@@ -197,17 +197,22 @@ class Controller:
         report('oracle_request', operation=self.operation)
         started = time.monotonic()
         response = method(*args, **kwargs)
+        headers=rate_limit_headers(getattr(response,'headers',{}))
+        if self.operation=='create_job':
+            self.submission_rate_headers=headers
         report('oracle_response', operation=self.operation, status=getattr(response,'status',None),
-               elapsed_seconds=round(time.monotonic()-started,2))
+               elapsed_seconds=round(time.monotonic()-started,2),
+               rate_limit_headers=headers)
         return response
 
     def all(self, method, *args, **kwargs):
         self.operation = getattr(method, '__name__', type(method).__name__)
         report('oracle_request', operation=self.operation, paginated=True)
         kwargs['retry_strategy'] = oci.retry.NoneRetryStrategy()
-        result = oci.pagination.list_call_get_all_results(method, *args, **kwargs).data
-        report('oracle_response', operation=self.operation, count=len(result))
-        return result
+        response = oci.pagination.list_call_get_all_results(method, *args, **kwargs)
+        report('oracle_response', operation=self.operation, count=len(response.data),
+               rate_limit_headers=rate_limit_headers(getattr(response,'headers',{})))
+        return response.data
 
     def jobs(self):
         return self.all(self.rm.list_jobs, compartment_id=self.tenancy, stack_id=self.stack_id,
@@ -308,19 +313,22 @@ class Controller:
 
 
 def pending_cooldown(diagnostic, now=None):
-    retry_at = diagnostic.get('retry_at')
+    retry_at = diagnostic.get('retry_at') or diagnostic.get('next_apply_at')
     if retry_at:
         deadline = datetime.datetime.fromisoformat(retry_at)
         now = now or datetime.datetime.now(datetime.timezone.utc)
         if deadline > now:
-            return {**diagnostic, 'outcome':'cooldown', 'wait_seconds':math.ceil((deadline-now).total_seconds())}
+            return {**diagnostic, 'outcome':'cooldown' if diagnostic.get('retry_at') else 'waiting',
+                    'wait_reason':'oracle_429' if diagnostic.get('retry_at') else 'adaptive_interval',
+                    'wait_seconds':math.ceil((deadline-now).total_seconds())}
     return None
 
 
 def throttle_diagnostic(error, previous=None, now=None):
     previous = previous or {}
     count = previous.get('consecutive_throttles',0) + 1
-    delay = min(1800, 180 * 2**min(count-1,4))
+    base=previous.get('attempt_interval_seconds',180)
+    delay = min(1800, max(base*2, 180 * 2**min(count-1,4)))
     now = now or datetime.datetime.now(datetime.timezone.utc)
     retry_after = next((str(v) for k,v in getattr(error,'headers',{}).items() if k.lower()=='retry-after'),'')
     if retry_after.isdigit():
@@ -331,7 +339,24 @@ def throttle_diagnostic(error, previous=None, now=None):
         except (ValueError, TypeError, OverflowError):
             pass
     return {'outcome':'throttled', **error_fields(error), 'consecutive_throttles':count,
+            'attempt_interval_seconds':delay,'successful_attempts_at_interval':0,
             'backoff_seconds':delay, 'retry_at':(now+datetime.timedelta(seconds=delay)).isoformat()}
+
+
+def adaptive_interval(outcome, previous=None, now=None):
+    previous=previous or {}
+    interval=previous.get('attempt_interval_seconds',previous.get('backoff_seconds',180))
+    stable=previous.get('successful_attempts_at_interval',0)
+    result={}
+    if outcome=='capacity':
+        stable+=1
+        if stable>=3:
+            interval=max(180,int(interval*0.9))
+            stable=0
+        now=now or datetime.datetime.now(datetime.timezone.utc)
+        result['next_apply_at']=(now+datetime.timedelta(seconds=interval)).isoformat()
+    result.update(attempt_interval_seconds=interval,successful_attempts_at_interval=stable)
+    return result
 
 
 def run_context(args):
@@ -378,13 +403,18 @@ def main():
             cooldown = gh.guard(read_only=args.dry_run)
             if cooldown and not args.dry_run:
                 diagnostic = cooldown
-                report('rate_limit_cooldown', **diagnostic)
+                report('attempt_waiting', **diagnostic)
                 return 0
         controller = Controller(args.local)
         outcome = controller.inspect()
         if outcome == 'ready' and not args.dry_run:
             outcome = controller.apply()
         diagnostic = {'outcome': outcome, 'dry_run':args.dry_run}
+        submission_headers=getattr(controller,'submission_rate_headers',None)
+        if isinstance(submission_headers,dict):
+            diagnostic['rate_limit_headers']=submission_headers
+        if not args.dry_run:
+            diagnostic.update(adaptive_interval(outcome,getattr(gh,'previous_diagnostic',{})))
         report('attempt_result', **diagnostic)
         if outcome == 'success' and gh and not args.dry_run:
             gh.stop(True, 'Existing Stack successfully created the audited Always Free VPS (1 OCPU / 6 GB).')
@@ -403,7 +433,7 @@ def main():
                 report('persist_stop_failed', **error_fields(stop_error))
         return 1
     finally:
-        previous_context=diagnostic.get('context',{}) if diagnostic.get('outcome')=='cooldown' else {}
+        previous_context=diagnostic.get('context',{}) if diagnostic.get('outcome') in {'cooldown','waiting'} else {}
         context.update(finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                        duration_seconds=round(time.monotonic()-started,2),
                        oracle_job_url=oracle_job_url(getattr(controller,'job_id',None)) or previous_context.get('oracle_job_url'),
