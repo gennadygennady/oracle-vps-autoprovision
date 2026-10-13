@@ -127,6 +127,9 @@ The Mac reads and caches each completed run's artifact to show the actual
 `capacity`, `throttled`, `cooldown`, `success` or `halted` outcome, rather than
 equating GitHub's `success` conclusion with a created VPS. Diagnostic-download
 failures are explicitly logged and do not change dispatch safety decisions.
+The last outcome is a historical observation. For cached cooldown results,
+`oracle_wait_seconds_at_run` preserves the original wait, while
+`oracle_wait_seconds` and `oracle_cooldown_active` are recomputed at the current tick.
 LaunchAgent: `~/Library/LaunchAgents/dev.gendi.oracle-vps-autoprovision.plist`.
 To stop the local timer:
 

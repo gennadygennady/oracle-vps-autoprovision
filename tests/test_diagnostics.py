@@ -11,7 +11,7 @@ import urllib.error
 import oci
 
 from diagnostics import safe_text
-from local_timer import GitHubAPIError, describe, latest_outcome
+from local_timer import GitHubAPIError, describe, latest_outcome, current_outcome_details
 from provision import GitHub, main, pending_cooldown, throttle_diagnostic, SafetyStop, oracle_job_url
 
 
@@ -165,6 +165,16 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIsNone(oracle_job_url('not-a-job'))
         tenancy='.'.join(['ocid1','tenancy','oc1','','a'*40])
         self.assertNotIn(tenancy,safe_text(tenancy))
+
+    def test_cached_wait_is_recomputed_not_reported_as_current(self):
+        cached={'last_oracle_outcome':'cooldown','oracle_wait_seconds':20,
+                'oracle_retry_at':'2026-10-13T10:00:00+00:00'}
+        now=datetime.datetime(2026,10,13,10,1,tzinfo=datetime.timezone.utc)
+        result=current_outcome_details(cached,now)
+        self.assertEqual(result['oracle_wait_seconds_at_run'],20)
+        self.assertEqual(result['oracle_wait_seconds'],0)
+        self.assertFalse(result['oracle_cooldown_active'])
+        self.assertEqual(cached['oracle_wait_seconds'],20)
 
 
 if __name__=='__main__':

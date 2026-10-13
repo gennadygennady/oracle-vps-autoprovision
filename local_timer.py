@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import re
+import math
 from types import SimpleNamespace
 from diagnostics import error_fields, report, safe_text, read_diagnostic_zip
 
@@ -88,6 +89,18 @@ def api(gh, method, suffix, data=None, binary=False):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
+def current_outcome_details(cached, now=None):
+    result=dict(cached)
+    if 'oracle_wait_seconds' in result:
+        result['oracle_wait_seconds_at_run']=result.pop('oracle_wait_seconds')
+    if result.get('oracle_retry_at'):
+        now=now or datetime.datetime.now(datetime.timezone.utc)
+        deadline=datetime.datetime.fromisoformat(result['oracle_retry_at'])
+        result['oracle_wait_seconds']=max(0,math.ceil((deadline-now).total_seconds()))
+        result['oracle_cooldown_active']=result['oracle_wait_seconds']>0
+    return result
+
+
 def latest_outcome(gh, runs):
     completed=next((r for r in runs if r['status']=='completed'),None)
     if not completed:
@@ -95,7 +108,7 @@ def latest_outcome(gh, runs):
     path=RUNTIME/'last_outcome.json'
     cached=json.loads(path.read_text()) if path.exists() else {}
     if cached.get('diagnostic_run_id')==completed['id']:
-        return cached
+        return current_outcome_details(cached)
     try:
         artifacts=api(gh,'GET',f'actions/runs/{completed["id"]}/artifacts')['artifacts']
         matches=[a for a in artifacts if a['name']==f'safe-diagnostic-{completed["id"]}' and not a['expired']]
@@ -112,7 +125,7 @@ def latest_outcome(gh, runs):
         cached['oracle_job_url']=context.get('oracle_job_url')
         path.write_text(json.dumps(cached))
         path.chmod(0o600)
-        return cached
+        return current_outcome_details(cached)
     except Exception as error:
         report('last_result_unavailable',run_url=completed.get('html_url'),**error_fields(error))
         return {'last_oracle_outcome':'unavailable','diagnostic_run_url':completed.get('html_url')}
