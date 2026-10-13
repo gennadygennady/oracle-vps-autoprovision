@@ -11,8 +11,8 @@ import urllib.error
 import oci
 
 from diagnostics import safe_text
-from local_timer import GitHubAPIError, describe
-from provision import GitHub, main, pending_cooldown, throttle_diagnostic
+from local_timer import GitHubAPIError, describe, latest_outcome
+from provision import GitHub, main, pending_cooldown, throttle_diagnostic, SafetyStop, oracle_job_url
 
 
 class DiagnosticsTests(unittest.TestCase):
@@ -67,6 +67,12 @@ class DiagnosticsTests(unittest.TestCase):
                     self.assertEqual(diagnostic['status'],status)
                     self.assertEqual(gh.stop.called,disable)
                     controller.apply.assert_not_called()
+                    context=diagnostic['context']
+                    self.assertEqual(context['mode'],'cloud-apply')
+                    self.assertEqual(context['oci_sdk_version'],oci.__version__)
+                    self.assertIn('python_version',context)
+                    self.assertGreaterEqual(context['duration_seconds'],0)
+                    self.assertGreaterEqual(context['finished_at'],context['started_at'])
                 finally:
                     os.chdir(original)
 
@@ -106,6 +112,59 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(result['wait_seconds'],120)
         self.assertEqual(result['latest_run_age_seconds'],60)
         self.assertEqual(result['latest_run_url'],run['html_url'])
+
+    def test_stop_keeps_both_underlying_failures(self):
+        gh=GitHub.__new__(GitHub)
+        gh.repo='owner/repo'
+        first=RuntimeError('disable rejected: insufficient permission')
+        second=RuntimeError('issue rejected: GitHub temporarily unavailable')
+        gh.request=Mock(side_effect=[first,second])
+        gh.issues=Mock(return_value=iter([]))
+        with patch.dict(os.environ,{'GITHUB_RUN_ID':'42'}),patch('provision.report') as logged:
+            with self.assertRaises(SafetyStop):
+                gh.stop(False,'safe reason')
+        self.assertEqual([e['operation'] for e in gh.stop_errors],['disable_workflow','create_stop_issue'])
+        self.assertIn('insufficient permission',gh.stop_errors[0]['message'])
+        self.assertIn('temporarily unavailable',gh.stop_errors[1]['message'])
+        self.assertEqual(logged.call_count,2)
+
+    def test_github_http_error_keeps_response_reason_and_request_id(self):
+        gh=GitHub.__new__(GitHub)
+        gh.repo='owner/repo'
+        gh.token='private-token'
+        error=urllib.error.HTTPError('https://api.github.com/test',403,'Forbidden',
+            {'X-GitHub-Request-Id':'request-42'},io.BytesIO(b'{"message":"Resource not accessible by integration"}'))
+        with patch('urllib.request.urlopen',side_effect=error):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                gh.request('PUT','/actions/workflows/provision.yml/disable')
+        self.assertEqual(raised.exception.status,403)
+        self.assertEqual(raised.exception.request_id,'request-42')
+        self.assertIn('Resource not accessible',raised.exception.message)
+
+    def test_local_result_reads_actual_outcome_once_per_run(self):
+        buffer=io.BytesIO()
+        with zipfile.ZipFile(buffer,'w') as archive:
+            archive.writestr('diagnostic.json',json.dumps({'outcome':'throttled','retry_at':'2026-10-13T12:00:00+00:00',
+                'backoff_seconds':360,'context':{'mode':'cloud-apply'}}))
+        run={'id':42,'status':'completed','conclusion':'success','html_url':'https://github.com/owner/repo/actions/runs/42'}
+        artifacts={'artifacts':[{'id':7,'name':'safe-diagnostic-42','expired':False}]}
+        with tempfile.TemporaryDirectory() as directory,patch('local_timer.RUNTIME',Path(directory)), \
+             patch('local_timer.api',side_effect=[artifacts,buffer.getvalue()]) as request:
+            first=latest_outcome('gh',[run])
+            second=latest_outcome('gh',[run])
+        self.assertEqual(first,second)
+        self.assertEqual(first['last_oracle_outcome'],'throttled')
+        self.assertEqual(first['oracle_backoff_seconds'],360)
+        self.assertEqual(first['diagnostic_mode'],'cloud-apply')
+        self.assertEqual(request.call_count,2)
+
+    def test_oracle_job_link_survives_redaction_but_credentials_do_not(self):
+        job_id='.'.join(['ocid1','ormjob','oc1','ap-singapore-2','a'*30])
+        url=oracle_job_url(job_id)
+        self.assertEqual(safe_text(url),url)
+        self.assertIsNone(oracle_job_url('not-a-job'))
+        tenancy='.'.join(['ocid1','tenancy','oc1','','a'*40])
+        self.assertNotIn(tenancy,safe_text(tenancy))
 
 
 if __name__=='__main__':

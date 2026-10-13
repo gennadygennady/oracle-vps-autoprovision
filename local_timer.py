@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import time
 import re
-from diagnostics import error_fields, report, safe_text
+from types import SimpleNamespace
+from diagnostics import error_fields, report, safe_text, read_diagnostic_zip
 
 REPO = 'gennadygennady/oracle-vps-autoprovision'
 WORKFLOW = 'provision.yml'
@@ -70,15 +71,51 @@ def disabled_reason(gh):
     return {'stop_reason':'No open safety/success Issue found; inspect GitHub workflow settings'}
 
 
-def api(gh, method, suffix, data=None):
+def api(gh, method, suffix, data=None, binary=False):
     command = [gh, 'api', '--method', method, f'repos/{REPO}/{suffix}']
     if data is not None:
         command += ['--input', '-']
-    result = subprocess.run(command, input=json.dumps(data) if data is not None else None,
-                            capture_output=True, text=True, timeout=45)
+    payload=json.dumps(data) if data is not None else None
+    result = subprocess.run(command, input=payload.encode() if binary and payload else payload,
+                            capture_output=True, text=not binary, timeout=45)
     if result.returncode:
+        if binary:
+            result=SimpleNamespace(returncode=result.returncode,stderr=result.stderr.decode(errors='replace'),
+                                   stdout=result.stdout.decode(errors='replace'))
         raise GitHubAPIError(method+' '+suffix.split('?')[0],result)
+    if binary:
+        return result.stdout
     return json.loads(result.stdout) if result.stdout.strip() else None
+
+
+def latest_outcome(gh, runs):
+    completed=next((r for r in runs if r['status']=='completed'),None)
+    if not completed:
+        return {'last_oracle_outcome':None}
+    path=RUNTIME/'last_outcome.json'
+    cached=json.loads(path.read_text()) if path.exists() else {}
+    if cached.get('diagnostic_run_id')==completed['id']:
+        return cached
+    try:
+        artifacts=api(gh,'GET',f'actions/runs/{completed["id"]}/artifacts')['artifacts']
+        matches=[a for a in artifacts if a['name']==f'safe-diagnostic-{completed["id"]}' and not a['expired']]
+        if len(matches)!=1:
+            report('last_result_unavailable',run_url=completed.get('html_url'),message='No unique unexpired diagnostic artifact')
+            return {'last_oracle_outcome':'unavailable','diagnostic_run_url':completed.get('html_url')}
+        data=read_diagnostic_zip(api(gh,'GET',f'actions/artifacts/{matches[0]["id"]}/zip',binary=True))
+        cached={'diagnostic_run_id':completed['id'],'diagnostic_run_url':completed.get('html_url'),
+                'last_oracle_outcome':data['outcome'],'diagnostic_mode':data.get('context',{}).get('mode')}
+        for field in ['retry_at','wait_seconds','backoff_seconds','consecutive_throttles','status','code','message']:
+            if field in data:
+                cached['oracle_'+field]=safe_text(data[field]) if isinstance(data[field],str) else data[field]
+        context=data.get('context',{})
+        cached['oracle_job_url']=context.get('oracle_job_url')
+        path.write_text(json.dumps(cached))
+        path.chmod(0o600)
+        return cached
+    except Exception as error:
+        report('last_result_unavailable',run_url=completed.get('html_url'),**error_fields(error))
+        return {'last_oracle_outcome':'unavailable','diagnostic_run_url':completed.get('html_url')}
 
 
 def main():
@@ -107,6 +144,8 @@ def main():
             workflow = api(gh, 'GET', f'actions/workflows/{WORKFLOW}')
             # Fetch all recent runs so an older still-active run also blocks dispatch.
             runs = api(gh, 'GET', f'actions/workflows/{WORKFLOW}/runs?per_page=30')['workflow_runs']
+            result_details=latest_outcome(gh,runs)
+            report('last_cloud_result',**result_details)
             choice = decision(workflow, runs, datetime.datetime.now(datetime.timezone.utc))
             # A tick can arrive a few seconds early relative to the previous POST.
             # Wait the small remainder instead of silently doubling the interval.
@@ -120,6 +159,7 @@ def main():
                     choice=decision(workflow,runs,datetime.datetime.now(datetime.timezone.utc))
             if choice != 'dispatch':
                 details=describe(choice,workflow,runs,datetime.datetime.now(datetime.timezone.utc))
+                details.update(result_details)
                 if choice=='disabled':
                     details.update(disabled_reason(gh))
                 report('timer_skip',**details)
@@ -132,6 +172,7 @@ def main():
             api(gh, 'POST', f'actions/workflows/{WORKFLOW}/dispatches',
                 {'ref':'main', 'inputs':{'dry_run':False}})
             report('dispatch_accepted',repo=REPO,ref='main',interval_seconds=INTERVAL,
+                   **result_details,
                    workflow_url=f'https://github.com/{REPO}/actions/workflows/{WORKFLOW}',
                    message='Cloud workflow accepted; Oracle jobs/state are checked there before Apply')
             return 0

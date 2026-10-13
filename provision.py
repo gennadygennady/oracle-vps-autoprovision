@@ -10,12 +10,14 @@ import os
 from pathlib import Path
 import re
 import time
+import platform
+import subprocess
 import urllib.request
 import urllib.error
 import zipfile
 
 import oci
-from diagnostics import error_fields, report, safe_text
+from diagnostics import error_fields, report, safe_text, read_diagnostic_zip
 
 REGION = 'ap-singapore-2'
 CONFIG_SHA256 = '5266612964d57c18270e5cc78917639a487de10b33b36ae61f7a189591614733'
@@ -82,9 +84,21 @@ class GitHub:
             data=json.dumps(body).encode() if body is not None else None,
             headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
                      'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'}, method=method)
-        with urllib.request.urlopen(req, timeout=25) as response:
-            content = response.read()
-            return json.loads(content) if content else None
+        try:
+            with urllib.request.urlopen(req, timeout=25) as response:
+                content = response.read()
+                return json.loads(content) if content else None
+        except urllib.error.HTTPError as error:
+            error.operation_name=self.operation
+            error.request_id=error.headers.get('X-GitHub-Request-Id')
+            try:
+                body=json.loads(error.read(65536))
+                error.message=safe_text(body.get('message',str(error)))
+            except (ValueError,TypeError):
+                error.message=safe_text(str(error))
+            finally:
+                error.close()
+            raise
 
     def issues(self):
         page = 1
@@ -128,17 +142,19 @@ class GitHub:
             response = urllib.request.urlopen(location, timeout=25)
         with response:
             content = response.read(1024*1024+1)
-        require(len(content) <= 1024*1024, 'Diagnostic artifact is too large')
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            require(archive.getinfo('diagnostic.json').file_size <= 65536, 'Diagnostic JSON is too large')
-            return json.loads(archive.read('diagnostic.json'))
+        return read_diagnostic_zip(content)
 
     def stop(self, success, reason):
         # Independent durable barriers: disabled workflow AND an open issue.
         errors = []
+        if not hasattr(self,'stop_errors'):
+            self.stop_errors=[]
         try:
             self.request('PUT', f'/actions/workflows/{WORKFLOW}/disable')
-        except Exception:
+        except Exception as error:
+            detail={'operation':'disable_workflow',**error_fields(error)}
+            self.stop_errors.append(detail)
+            report('workflow_disable_failed',**detail)
             errors.append('Could not disable workflow')
         title = SUCCESS_TITLE if success else STOP_TITLE
         try:
@@ -147,7 +163,10 @@ class GitHub:
                 self.request('POST', '/issues', {'title': title, 'body':
                     f'{reason}\n\nRun: {run}\n\nAutomatic Apply is stopped. '
                     'Review Oracle privately before resuming. Do not paste credentials, Terraform state or raw Oracle logs here.'})
-        except Exception:
+        except Exception as error:
+            detail={'operation':'create_stop_issue',**error_fields(error)}
+            self.stop_errors.append(detail)
+            report('stop_issue_failed',**detail)
             errors.append('Could not create persistent issue')
         require(not errors, '; '.join(errors))
 
@@ -221,6 +240,9 @@ class Controller:
         expected_name = re.search(r'\n\s*display_name\s*=\s*"(instance-[^"]+)"', text).group(1)
         ad = re.search(r'availability_domain\s*=\s*"([^"]+)"', text).group(1)
         jobs = self.jobs()
+        if jobs:
+            selected=next((j for j in jobs if j.lifecycle_state in ACTIVE_JOBS),jobs[0])
+            self.job_id=getattr(selected,'id',None)
         report('stack_jobs', total=len(jobs), active=sum(j.lifecycle_state in ACTIVE_JOBS for j in jobs),
                latest_status=jobs[0].lifecycle_state if jobs else None)
         if any(j.lifecycle_state in ACTIVE_JOBS for j in jobs):
@@ -312,15 +334,44 @@ def throttle_diagnostic(error, previous=None, now=None):
             'backoff_seconds':delay, 'retry_at':(now+datetime.timedelta(seconds=delay)).isoformat()}
 
 
+def run_context(args):
+    repo=os.environ.get('GITHUB_REPOSITORY')
+    run_id=os.environ.get('GITHUB_RUN_ID')
+    sha=os.environ.get('GITHUB_SHA')
+    if not sha:
+        try:
+            result=subprocess.run(['git','rev-parse','HEAD'],cwd=Path(__file__).parent,
+                                  capture_output=True,text=True,timeout=3)
+            sha=result.stdout.strip() if result.returncode==0 else None
+        except (OSError,subprocess.TimeoutExpired):
+            sha=None
+    return {'schema_version':1,'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'run_id':run_id,'run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT'),
+            'run_url':f'https://github.com/{repo}/actions/runs/{run_id}' if repo and run_id else None,
+            'commit_sha':sha,'python_version':platform.python_version(),'oci_sdk_version':oci.__version__,
+            'trigger':os.environ.get('GITHUB_EVENT_NAME','local'),
+            'mode':'local-dry-run' if args.local else 'cloud-dry-run' if args.dry_run else 'cloud-apply',
+            'region':REGION,'stack_name':'aboba-instance'}
+
+
+def oracle_job_url(job_id):
+    if isinstance(job_id,str) and re.fullmatch(r'ocid1\.ormjob\.oc1\.ap-singapore-2\.[A-Za-z0-9_.-]+',job_id):
+        return f'https://cloud.oracle.com/resourcemanager/jobs/{job_id}?region={REGION}'
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--local', action='store_true')
     args = parser.parse_args()
+    context=run_context(args)
+    started=time.monotonic()
     require(not args.local or args.dry_run, 'Local mode must be read-only')
     gh = None
     controller = None
     diagnostic = {}
+    report('attempt_started',**context)
     try:
         if not args.local:
             gh = GitHub()
@@ -352,6 +403,16 @@ def main():
                 report('persist_stop_failed', **error_fields(stop_error))
         return 1
     finally:
+        previous_context=diagnostic.get('context',{}) if diagnostic.get('outcome')=='cooldown' else {}
+        context.update(finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                       duration_seconds=round(time.monotonic()-started,2),
+                       oracle_job_url=oracle_job_url(getattr(controller,'job_id',None)) or previous_context.get('oracle_job_url'),
+                       previous_run_url=previous_context.get('run_url'))
+        diagnostic['context']=context
+        stop_errors=getattr(gh,'stop_errors',None)
+        if isinstance(stop_errors,list) and stop_errors:
+            diagnostic['stop_errors']=stop_errors
+        report('attempt_finished',outcome=diagnostic.get('outcome'),**context)
         Path('diagnostic.json').write_text(json.dumps(diagnostic, indent=2))
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:

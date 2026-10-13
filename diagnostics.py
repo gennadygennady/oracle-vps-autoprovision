@@ -4,6 +4,8 @@ import json
 import os
 import re
 import traceback
+import io
+import zipfile
 
 
 def safe_text(value):
@@ -13,9 +15,16 @@ def safe_text(value):
             text = text.replace(secret, '[REDACTED]')
     text = re.sub(r'(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|\Z)', '[PRIVATE_KEY_REDACTED]', text)
     text = re.sub(r'(?:github_pat_[A-Za-z0-9_]+|gh[opusr]_[A-Za-z0-9_]+)', '[TOKEN_REDACTED]', text)
-    text = re.sub(r'ocid1\.[A-Za-z0-9_.:-]+', '[OCID_REDACTED]', text)
+    # Resource Manager job IDs identify a resource, not an authentication secret.
+    # Keep them so diagnostic Console links work; other OCIDs stay masked.
+    text = re.sub(r'ocid1\.(?!ormjob\.)[A-Za-z0-9_.:-]+', '[OCID_REDACTED]', text)
     text = re.sub(r'(?i)(authorization\s*[:=]\s*(?:bearer\s+|token\s+)?)[^\s,;]+', r'\1[REDACTED]', text)
-    text = re.sub(r'https://([^\s?]+)\?[^\s]+', r'https://\1?[QUERY_REDACTED]', text)
+    def clean_url(match):
+        url=match.group(0)
+        if re.fullmatch(r'https://cloud\.oracle\.com/resourcemanager/jobs/ocid1\.ormjob\.oc1\.ap-singapore-2\.[A-Za-z0-9_.-]+\?region=ap-singapore-2',url):
+            return url
+        return 'https://'+match.group(1)+'?[QUERY_REDACTED]'
+    text = re.sub(r'https://([^\s?]+)\?[^\s]+', clean_url, text)
     return re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)[:2400]
 
 
@@ -34,3 +43,15 @@ def error_fields(error):
     fields['frames'] = [{'file':os.path.basename(f.filename),'line':f.lineno,'function':f.name}
                         for f in traceback.extract_tb(error.__traceback__)[-5:]]
     return fields
+
+
+def read_diagnostic_zip(content):
+    if len(content)>1024*1024:
+        raise ValueError('Diagnostic artifact is too large')
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        if archive.getinfo('diagnostic.json').file_size>65536:
+            raise ValueError('Diagnostic JSON is too large')
+        data=json.loads(archive.read('diagnostic.json'))
+    if not isinstance(data,dict) or not isinstance(data.get('outcome'),str):
+        raise ValueError('Diagnostic artifact has no valid outcome')
+    return data

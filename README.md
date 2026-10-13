@@ -117,6 +117,16 @@ redacted error text and the planned next check. Long tick gaps are reported;
 the Mac's sleep history (`pmset -g log`) can distinguish sleep from other delays.
 Oracle logs include each API operation, response counts, Apply status,
 redacted error message, request ID, retry deadline and code location.
+`diagnostic.json` also carries a `context` object: run ID/attempt/link, commit SHA,
+Python and OCI SDK versions, trigger, mode, UTC start/end times, duration and
+Oracle job Console link. Resource Manager job OCIDs are resource identifiers and
+are preserved in links; authentication credentials and other OCIDs remain masked.
+Underlying failures disabling the workflow or creating its stop Issue are logged
+separately and retained in `stop_errors` in the same artifact.
+The Mac reads and caches each completed run's artifact to show the actual
+`capacity`, `throttled`, `cooldown`, `success` or `halted` outcome, rather than
+equating GitHub's `success` conclusion with a created VPS. Diagnostic-download
+failures are explicitly logged and do not change dispatch safety decisions.
 LaunchAgent: `~/Library/LaunchAgents/dev.gendi.oracle-vps-autoprovision.plist`.
 To stop the local timer:
 
