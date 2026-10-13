@@ -20,7 +20,7 @@ class MacInstallTests(unittest.TestCase):
     def test_migration_is_idempotent_and_preserves_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
             repo,home=self.fixture(directory)
-            runtime,generated,agent,links=layout(repo,home)
+            runtime,agent,links=layout(repo,home)
             runtime.mkdir(parents=True)
             agent.parent.mkdir(parents=True)
             for name in ['local_timer.py','diagnostics.py']:
@@ -33,6 +33,8 @@ class MacInstallTests(unittest.TestCase):
             validate_existing(repo,home)
             write_layout(repo,home,'/usr/bin/python3','/usr/bin/gh')
             self.assertEqual(check_layout(repo,home),[])
+            self.assertFalse(agent.is_symlink())
+            self.assertFalse((repo/'.local').exists())
             for destination,target in links.items():
                 self.assertTrue(destination.is_symlink())
                 self.assertEqual(destination.resolve(),target.resolve())
@@ -46,7 +48,7 @@ class MacInstallTests(unittest.TestCase):
     def test_wrong_links_and_changed_copies_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             repo,home=self.fixture(directory)
-            runtime,_,_,_=layout(repo,home)
+            runtime,_,_=layout(repo,home)
             runtime.mkdir(parents=True)
             destination=runtime/'local_timer.py'
             destination.write_text('locally changed source')
@@ -65,14 +67,33 @@ class MacInstallTests(unittest.TestCase):
             repo,home=self.fixture(directory)
             self.assertTrue(check_layout(repo,home))
             write_layout(repo,home,'/usr/bin/python3','/usr/bin/gh')
-            runtime,generated,_,_=layout(repo,home)
+            runtime,agent,_=layout(repo,home)
             (runtime/'diagnostics.py').unlink()
             self.assertTrue(any('symlink' in e for e in check_layout(repo,home)))
             write_layout(repo,home,'/usr/bin/python3','/usr/bin/gh')
-            data=plistlib.loads(generated.read_bytes())
+            data=plistlib.loads(agent.read_bytes())
             data['StartInterval']=300
-            generated.write_bytes(plistlib.dumps(data))
+            agent.write_bytes(plistlib.dumps(data))
             self.assertTrue(any('StartInterval' in e for e in check_layout(repo,home)))
+
+    def test_legacy_plist_symlink_is_migrated_and_local_directory_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo,home=self.fixture(directory)
+            runtime,agent,_=layout(repo,home)
+            legacy=repo/'.local'/f'{LABEL}.plist'
+            legacy.parent.mkdir()
+            legacy.write_bytes(plistlib.dumps({'Label':LABEL}))
+            agent.parent.mkdir(parents=True)
+            agent.symlink_to(legacy)
+            self.assertTrue(any('regular file' in e for e in check_layout(repo,home)))
+            validate_existing(repo,home)
+            write_layout(repo,home,'/usr/bin/python3','/usr/bin/gh')
+            self.assertEqual(check_layout(repo,home),[])
+            self.assertFalse(agent.is_symlink())
+            self.assertFalse(legacy.parent.exists())
+            validate_existing(repo,home)
+            write_layout(repo,home,'/usr/bin/python3','/usr/bin/gh')
+            self.assertEqual(check_layout(repo,home),[])
 
 
 if __name__=='__main__':
