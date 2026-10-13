@@ -16,6 +16,13 @@ from provision import GitHub, main, pending_cooldown, throttle_diagnostic, Safet
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        # main() writes an Actions summary in production. Test scenarios must
+        # never append their synthetic failures to the real runner summary.
+        summary=patch.dict(os.environ,{'GITHUB_STEP_SUMMARY':''})
+        summary.start()
+        self.addCleanup(summary.stop)
+
     def test_redaction_preserves_useful_error(self):
         token='ghp_'+'a'*36
         text='HTTP 403 '+token+' Authorization: Bearer '+token+' https://host/file?signature=secret'
