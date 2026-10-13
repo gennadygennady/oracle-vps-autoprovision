@@ -98,6 +98,41 @@ References:
 
 ## Optional Mac fallback timer
 
+Install or update from the local clone (requires Python 3 and an authenticated
+GitHub CLI):
+
+```sh
+./install.sh
+./check.sh
+```
+
+`install.sh` restarts this user's timer and installs three symlinks:
+
+| Installed path | Repository target |
+| --- | --- |
+| `~/Library/Application Support/OracleAutoProvision/local_timer.py` | `local_timer.py` |
+| `~/Library/Application Support/OracleAutoProvision/diagnostics.py` | `diagnostics.py` |
+| `~/Library/LaunchAgents/dev.gendi.oracle-vps-autoprovision.plist` | `.local/dev.gendi.oracle-vps-autoprovision.plist` |
+
+The plist is generated from `macos/launchagent.plist.template` into the ignored
+`.local/` directory using this clone's absolute paths and discovered Python/gh
+paths. It contains no credentials. Keep the clone in place while the timer is
+installed. Python source changes are immediately visible through the links;
+rerun `install.sh` after changing the interval or plist template. Moving the clone
+requires reviewing/replacing its old installation links first.
+The installer migrates identical legacy source copies, preserving logs/cache,
+and refuses to overwrite locally edited source or unrelated links.
+
+`check.sh` verifies all three symlink targets, generated plist fields, private
+directory/file permissions, Python/gh availability, and the loaded LaunchAgent
+interval. It is read-only and makes no Oracle requests or workflow dispatches.
+It prints the last timer exit code for diagnosis; inspect `timer.log` for failures.
+
+Only code, template, installer, checks and tests are tracked. Logs, lock, caches
+stay in Application Support; machine-specific `.local/` is ignored. Oracle
+credentials remain in `~/.oci/` and GitHub Secrets, and are never read by these
+installation/check scripts. No installation depends on `/private/tmp` scripts.
+
 `local_timer.py` uses the existing `gh` login to check the cloud workflow every
 180 seconds via a macOS LaunchAgent. It dispatches the same workflow only when it
 is active, has no active runs, the last run succeeded, and no run was created

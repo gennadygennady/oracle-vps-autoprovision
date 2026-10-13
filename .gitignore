@@ -7,3 +7,7 @@ diagnostic.json
 *.zip
 *.log
 .env*
+.local/
+timer.lock
+last_tick.json
+last_outcome.json
