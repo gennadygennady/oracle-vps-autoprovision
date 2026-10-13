@@ -1,5 +1,7 @@
 """Fail-closed controller for one pre-existing, audited Oracle RM stack."""
 import argparse
+import datetime
+from email.utils import parsedate_to_datetime
 import hashlib
 import io
 import json
@@ -9,9 +11,11 @@ from pathlib import Path
 import re
 import time
 import urllib.request
+import urllib.error
 import zipfile
 
 import oci
+from diagnostics import error_fields, report, safe_text
 
 REGION = 'ap-singapore-2'
 CONFIG_SHA256 = '5266612964d57c18270e5cc78917639a487de10b33b36ae61f7a189591614733'
@@ -73,6 +77,7 @@ class GitHub:
         self.token = os.environ['GH_TOKEN']
 
     def request(self, method, path, body=None):
+        self.operation = method + ' ' + path.split('?')[0]
         req = urllib.request.Request('https://api.github.com/repos/' + self.repo + path,
             data=json.dumps(body).encode() if body is not None else None,
             headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
@@ -93,11 +98,40 @@ class GitHub:
     def guard(self, read_only=False):
         issues = list(self.issues())
         if read_only:
-            return
+            return None
         require(not any(i['title'] == STOP_TITLE for i in issues), 'Persistent safety stop issue is open')
         require(not any(i['title'] == SUCCESS_TITLE for i in issues), 'Persistent success latch is open')
         runs = self.request('GET', f'/actions/workflows/{WORKFLOW}/runs?status=completed&per_page=1')['workflow_runs']
         require(not runs or runs[0]['conclusion'] == 'success', 'Previous workflow did not finish successfully')
+        self.previous_diagnostic = self.read_diagnostic(runs[0]) if runs else {}
+        return pending_cooldown(self.previous_diagnostic)
+
+    def read_diagnostic(self, run):
+        self.operation = 'Read prior safe-diagnostic artifact'
+        artifacts = self.request('GET', f'/actions/runs/{run["id"]}/artifacts')['artifacts']
+        matches = [a for a in artifacts if a['name'] == f'safe-diagnostic-{run["id"]}' and not a['expired']]
+        require(len(matches) == 1, 'Previous run has no unique readable diagnostic artifact')
+        # Obtain the signed artifact URL without forwarding the GitHub token to storage.
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        url = 'https://api.github.com/repos/' + self.repo + f'/actions/artifacts/{matches[0]["id"]}/zip'
+        req = urllib.request.Request(url, headers={'Authorization':'Bearer '+self.token,
+            'Accept':'application/vnd.github+json'})
+        try:
+            response = urllib.request.build_opener(NoRedirect()).open(req, timeout=25)
+        except urllib.error.HTTPError as error:
+            require(error.code == 302, 'Could not obtain previous diagnostic artifact')
+            location = error.headers['Location']
+            error.close()
+            require(location.startswith('https://'), 'Unsafe artifact redirect')
+            response = urllib.request.urlopen(location, timeout=25)
+        with response:
+            content = response.read(1024*1024+1)
+        require(len(content) <= 1024*1024, 'Diagnostic artifact is too large')
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            require(archive.getinfo('diagnostic.json').file_size <= 65536, 'Diagnostic JSON is too large')
+            return json.loads(archive.read('diagnostic.json'))
 
     def stop(self, success, reason):
         # Independent durable barriers: disabled workflow AND an open issue.
@@ -139,10 +173,22 @@ class Controller:
         self.compute = oci.core.ComputeClient(**options)
         self.block = oci.core.BlockstorageClient(**options)
 
-    @staticmethod
-    def all(method, *args, **kwargs):
+    def call(self, method, *args, **kwargs):
+        self.operation = getattr(method, '__name__', type(method).__name__)
+        report('oracle_request', operation=self.operation)
+        started = time.monotonic()
+        response = method(*args, **kwargs)
+        report('oracle_response', operation=self.operation, status=getattr(response,'status',None),
+               elapsed_seconds=round(time.monotonic()-started,2))
+        return response
+
+    def all(self, method, *args, **kwargs):
+        self.operation = getattr(method, '__name__', type(method).__name__)
+        report('oracle_request', operation=self.operation, paginated=True)
         kwargs['retry_strategy'] = oci.retry.NoneRetryStrategy()
-        return oci.pagination.list_call_get_all_results(method, *args, **kwargs).data
+        result = oci.pagination.list_call_get_all_results(method, *args, **kwargs).data
+        report('oracle_response', operation=self.operation, count=len(result))
+        return result
 
     def jobs(self):
         return self.all(self.rm.list_jobs, compartment_id=self.tenancy, stack_id=self.stack_id,
@@ -160,7 +206,7 @@ class Controller:
         subscriptions = self.all(self.identity.list_region_subscriptions, self.tenancy)
         require(any(s.region_name == REGION and s.is_home_region and s.status == 'READY' for s in subscriptions),
                 'Configured region is not the ready home region')
-        stack = self.rm.get_stack(self.stack_id).data
+        stack = self.call(self.rm.get_stack, self.stack_id).data
         require(stack.display_name == 'aboba-instance' and stack.lifecycle_state == 'ACTIVE', 'Stack identity/status changed')
         require(stack.compartment_id == self.tenancy, 'Stack compartment changed')
         require(stack.config_source.config_source_type == 'ZIP_UPLOAD', 'Stack config source changed')
@@ -168,21 +214,23 @@ class Controller:
         require(stack.terraform_version == '1.5.x', 'Terraform version changed')
         require(stack.variables == {'region':REGION, 'tenancy_ocid':self.tenancy, 'compartment_ocid':self.tenancy},
                 'Stack variables changed')
-        content = self.rm.get_stack_tf_config(self.stack_id).data.content
+        content = self.call(self.rm.get_stack_tf_config, self.stack_id).data.content
         require(config_digest(content) == CONFIG_SHA256, 'Audited Terraform configuration changed')
         text = zipfile.ZipFile(io.BytesIO(content)).read('main.tf').decode()
         image_id = re.search(r'source_id\s*=\s*"([^"]+)"', text).group(1)
         expected_name = re.search(r'\n\s*display_name\s*=\s*"(instance-[^"]+)"', text).group(1)
         ad = re.search(r'availability_domain\s*=\s*"([^"]+)"', text).group(1)
         jobs = self.jobs()
+        report('stack_jobs', total=len(jobs), active=sum(j.lifecycle_state in ACTIVE_JOBS for j in jobs),
+               latest_status=jobs[0].lifecycle_state if jobs else None)
         if any(j.lifecycle_state in ACTIVE_JOBS for j in jobs):
             return 'busy'
         require(not any(j.lifecycle_state not in ACTIVE_JOBS | {'SUCCEEDED','FAILED','CANCELED'} for j in jobs),
                 'Unknown job lifecycle state')
-        state = json.loads(self.rm.get_stack_tf_state(self.stack_id).data.content)
+        state = json.loads(self.call(self.rm.get_stack_tf_state, self.stack_id).data.content)
         ids = state_instances(state)
         if ids:
-            instance = self.compute.get_instance(ids[0]).data
+            instance = self.call(self.compute.get_instance, ids[0]).data
             require(instance.shape == 'VM.Standard.A1.Flex' and instance.shape_config.ocpus == 1 and
                     instance.shape_config.memory_in_gbs == 6 and instance.availability_domain == ad and
                     instance.compartment_id == self.tenancy and instance.image_id == image_id, 'State instance parameters changed')
@@ -204,10 +252,12 @@ class Controller:
             volumes.extend(self.all(self.block.list_volumes, compartment_id=cid))
         require(not any(i.display_name == expected_name and i.lifecycle_state != 'TERMINATED' for i in instances),
                 'Matching instance exists outside Terraform state; refusing duplicate')
-        image = self.compute.get_image(image_id).data
+        image = self.call(self.compute.get_image, image_id).data
         require(image.operating_system == 'Canonical Ubuntu', 'Image eligibility changed')
         boot_gb = max(50, math.ceil(image.size_in_mbs / 1024))
         check_free_budget(instances, boots, volumes, boot_gb)
+        report('free_budget_checked', compartments=len(cids), instances=len(instances), boot_volumes=len(boots),
+               block_volumes=len(volumes), new_boot_gb=boot_gb, ocpus=1, ram_gb=6)
         return 'ready'
 
     def apply(self):
@@ -219,10 +269,13 @@ class Controller:
                 execution_plan_strategy='AUTO_APPROVED', is_provider_upgrade_required=False))
         # Single submission, no automatic SDK retries on an ambiguous POST.
         token = hashlib.sha256((os.environ['GITHUB_REPOSITORY'] + ':' + os.environ['GITHUB_RUN_ID']).encode()).hexdigest()
-        job = self.rm.create_job(details, opc_retry_token=token).data
+        job = self.call(self.rm.create_job, details, opc_retry_token=token).data
+        self.job_id = job.id
+        report('apply_submitted', job_id=safe_text(job.id), job_reference=hashlib.sha256(job.id.encode()).hexdigest()[:12])
         deadline = time.monotonic() + 150
         while time.monotonic() < deadline:
-            job = self.rm.get_job(job.id).data
+            job = self.call(self.rm.get_job, job.id).data
+            report('apply_status', state=job.lifecycle_state)
             if job.lifecycle_state not in ACTIVE_JOBS:
                 if job.lifecycle_state == 'SUCCEEDED':
                     return self.inspect()
@@ -232,6 +285,33 @@ class Controller:
         return 'busy'
 
 
+def pending_cooldown(diagnostic, now=None):
+    retry_at = diagnostic.get('retry_at')
+    if retry_at:
+        deadline = datetime.datetime.fromisoformat(retry_at)
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        if deadline > now:
+            return {**diagnostic, 'outcome':'cooldown', 'wait_seconds':math.ceil((deadline-now).total_seconds())}
+    return None
+
+
+def throttle_diagnostic(error, previous=None, now=None):
+    previous = previous or {}
+    count = previous.get('consecutive_throttles',0) + 1
+    delay = min(1800, 180 * 2**min(count-1,4))
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    retry_after = next((str(v) for k,v in getattr(error,'headers',{}).items() if k.lower()=='retry-after'),'')
+    if retry_after.isdigit():
+        delay = max(delay,int(retry_after))
+    elif retry_after:
+        try:
+            delay = max(delay, math.ceil((parsedate_to_datetime(retry_after)-now).total_seconds()))
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return {'outcome':'throttled', **error_fields(error), 'consecutive_throttles':count,
+            'backoff_seconds':delay, 'retry_at':(now+datetime.timedelta(seconds=delay)).isoformat()}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true')
@@ -239,32 +319,37 @@ def main():
     args = parser.parse_args()
     require(not args.local or args.dry_run, 'Local mode must be read-only')
     gh = None
+    controller = None
     diagnostic = {}
     try:
         if not args.local:
             gh = GitHub()
-            gh.guard(read_only=args.dry_run)
+            cooldown = gh.guard(read_only=args.dry_run)
+            if cooldown and not args.dry_run:
+                diagnostic = cooldown
+                report('rate_limit_cooldown', **diagnostic)
+                return 0
         controller = Controller(args.local)
         outcome = controller.inspect()
         if outcome == 'ready' and not args.dry_run:
             outcome = controller.apply()
         diagnostic = {'outcome': outcome, 'dry_run':args.dry_run}
-        print(json.dumps(diagnostic))
+        report('attempt_result', **diagnostic)
         if outcome == 'success' and gh and not args.dry_run:
             gh.stop(True, 'Existing Stack successfully created the audited Always Free VPS (1 OCPU / 6 GB).')
     except Exception as error:
-        # Never print exception bodies, raw Terraform logs, state or credentials.
-        diagnostic = {'outcome':'halted', 'error_type':type(error).__name__}
-        if isinstance(error, SafetyStop):
-            diagnostic['reason'] = str(error)
-        if isinstance(error, oci.exceptions.ServiceError):
-            diagnostic.update(status=error.status, code=error.code, request_id=error.request_id)
-        print(json.dumps(diagnostic))
+        diagnostic = {'outcome':'halted', **error_fields(error),
+            'operation':getattr(error,'operation_name',None) or getattr(controller,'operation',None) or getattr(gh,'operation',None)}
+        if isinstance(error, oci.exceptions.ServiceError) and error.status == 429:
+            diagnostic = {**diagnostic, **throttle_diagnostic(error,getattr(gh,'previous_diagnostic',{}))}
+            report('oracle_rate_limited', **diagnostic)
+            return 1 if args.dry_run else 0
+        report('attempt_halted', **diagnostic)
         if gh and not args.dry_run:
             try:
                 gh.stop(False, json.dumps(diagnostic))
-            except Exception:
-                print('Could not fully persist the stop. Previous failed run remains an additional Apply barrier.')
+            except Exception as stop_error:
+                report('persist_stop_failed', **error_fields(stop_error))
         return 1
     finally:
         Path('diagnostic.json').write_text(json.dumps(diagnostic, indent=2))

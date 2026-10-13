@@ -34,10 +34,19 @@ GitHub concurrency cannot lock another operator's external actions.
 
 Only a FAILED Apply whose every Terraform `Error:` heading contains
 `Out of host capacity` can be retried. Generic HTTP 500 errors, canceled jobs,
-unknown statuses, API/authentication failures, changed configuration, exhausted
+unknown statuses, API/authentication failures (except Oracle throttling), changed configuration, exhausted
 budgets, and inconsistent state stop automation. Raw Oracle logs and state are
 never uploaded. Safe status, error class, Oracle error code and request ID are
 saved in the run summary and diagnostic artifact.
+
+Oracle API HTTP 429 is temporary: the attempt ends without immediately repeating
+Apply, and the workflow remains active. The next retry deadline is saved in the
+safe diagnostic artifact, and every following workflow reads it before making
+Oracle calls. Consecutive throttles back off for 180, 360, 720, 1440, then at most
+1800 seconds (a longer server `Retry-After` is respected). Non-throttled attempts
+reset the counter. No Oracle calls or Apply occur during cooldown. An interrupted
+Apply is always discovered through jobs/state on the next actual inspection.
+Missing or expired prior diagnostic artifacts cause a clearly logged safety stop.
 
 An open safety/success Issue is a durable latch even if workflow disabling fails.
 A previous unsuccessful GitHub run is an additional barrier. Do not delete the
@@ -100,6 +109,14 @@ disabled workflow prevents further timer dispatches.
 
 The Mac must be awake and the user logged in. Sleeping/offline time is not replayed.
 Logs: `~/Library/Application Support/OracleAutoProvision/timer.log`.
+Each tick includes local time with UTC offset, time since the previous tick,
+the last workflow event/result/link, and the reason and remaining wait when
+skipped. Disabled workflows include the safety/success Issue and its reason.
+API errors include the operation, HTTP status if available, CLI exit code,
+redacted error text and the planned next check. Long tick gaps are reported;
+the Mac's sleep history (`pmset -g log`) can distinguish sleep from other delays.
+Oracle logs include each API operation, response counts, Apply status,
+redacted error message, request ID, retry deadline and code location.
 LaunchAgent: `~/Library/LaunchAgents/dev.gendi.oracle-vps-autoprovision.plist`.
 To stop the local timer:
 
